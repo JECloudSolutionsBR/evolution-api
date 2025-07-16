@@ -99,7 +99,6 @@ import makeWASocket, {
   Contact,
   delay,
   DisconnectReason,
-  downloadContentFromMessage,
   downloadMediaMessage,
   generateWAMessageFromContent,
   getAggregateVotesInPollMessage,
@@ -1036,16 +1035,6 @@ export class BaileysStartupService extends ChannelStartupService {
     ) => {
       try {
         for (const received of messages) {
-          if (
-            received?.messageStubParameters?.some?.((param) =>
-              ['No matching sessions found for message', 'Bad MAC', 'failed to decrypt message', 'SessionError'].some(
-                (err) => param?.includes?.(err),
-              ),
-            )
-          ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
-            continue;
-          }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
             const text = received.message?.conversation || received.message?.extendedTextMessage?.text;
 
@@ -1237,41 +1226,33 @@ export class BaileysStartupService extends ChannelStartupService {
               if (this.configService.get<S3>('S3').ENABLE) {
                 try {
                   const message: any = received;
+                  const media = await this.getBase64FromMediaMessage({ message }, true);
 
-                  // Verificação adicional para garantir que há conteúdo de mídia real
-                  const hasRealMedia = this.hasValidMediaContent(message);
+                  const { buffer, mediaType, fileName, size } = media;
+                  const mimetype = mimeTypes.lookup(fileName).toString();
+                  const fullName = join(
+                    `${this.instance.id}`,
+                    received.key.remoteJid,
+                    mediaType,
+                    `${Date.now()}_${fileName}`,
+                  );
+                  await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
-                  if (!hasRealMedia) {
-                    this.logger.warn('Message detected as media but contains no valid media content');
-                  } else {
-                    const media = await this.getBase64FromMediaMessage({ message }, true);
+                  await this.prismaRepository.media.create({
+                    data: {
+                      messageId: msg.id,
+                      instanceId: this.instanceId,
+                      type: mediaType,
+                      fileName: fullName,
+                      mimetype,
+                    },
+                  });
 
-                    const { buffer, mediaType, fileName, size } = media;
-                    const mimetype = mimeTypes.lookup(fileName).toString();
-                    const fullName = join(
-                      `${this.instance.id}`,
-                      received.key.remoteJid,
-                      mediaType,
-                      `${Date.now()}_${fileName}`,
-                    );
-                    await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+                  const mediaUrl = await s3Service.getObjectUrl(fullName);
 
-                    await this.prismaRepository.media.create({
-                      data: {
-                        messageId: msg.id,
-                        instanceId: this.instanceId,
-                        type: mediaType,
-                        fileName: fullName,
-                        mimetype,
-                      },
-                    });
+                  messageRaw.message.mediaUrl = mediaUrl;
 
-                    const mediaUrl = await s3Service.getObjectUrl(fullName);
-
-                    messageRaw.message.mediaUrl = mediaUrl;
-
-                    await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
-                  }
+                  await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
                 } catch (error) {
                   this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
                 }
@@ -2140,39 +2121,31 @@ export class BaileysStartupService extends ChannelStartupService {
         if (isMedia && this.configService.get<S3>('S3').ENABLE) {
           try {
             const message: any = messageRaw;
+            const media = await this.getBase64FromMediaMessage({ message }, true);
 
-            // Verificação adicional para garantir que há conteúdo de mídia real
-            const hasRealMedia = this.hasValidMediaContent(message);
+            const { buffer, mediaType, fileName, size } = media;
 
-            if (!hasRealMedia) {
-              this.logger.warn('Message detected as media but contains no valid media content');
-            } else {
-              const media = await this.getBase64FromMediaMessage({ message }, true);
+            const mimetype = mimeTypes.lookup(fileName).toString();
 
-              const { buffer, mediaType, fileName, size } = media;
+            const fullName = join(
+              `${this.instance.id}`,
+              messageRaw.key.remoteJid,
+              `${messageRaw.key.id}`,
+              mediaType,
+              fileName,
+            );
 
-              const mimetype = mimeTypes.lookup(fileName).toString();
+            await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
-              const fullName = join(
-                `${this.instance.id}`,
-                messageRaw.key.remoteJid,
-                `${messageRaw.key.id}`,
-                mediaType,
-                fileName,
-              );
+            await this.prismaRepository.media.create({
+              data: { messageId: msg.id, instanceId: this.instanceId, type: mediaType, fileName: fullName, mimetype },
+            });
 
-              await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+            const mediaUrl = await s3Service.getObjectUrl(fullName);
 
-              await this.prismaRepository.media.create({
-                data: { messageId: msg.id, instanceId: this.instanceId, type: mediaType, fileName: fullName, mimetype },
-              });
+            messageRaw.message.mediaUrl = mediaUrl;
 
-              const mediaUrl = await s3Service.getObjectUrl(fullName);
-
-              messageRaw.message.mediaUrl = mediaUrl;
-
-              await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
-            }
+            await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
           } catch (error) {
             this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
           }
@@ -3440,18 +3413,6 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async mapMediaType(mediaType) {
-    const map = {
-      imageMessage: 'image',
-      videoMessage: 'video',
-      documentMessage: 'document',
-      stickerMessage: 'sticker',
-      audioMessage: 'audio',
-      ptvMessage: 'video',
-    };
-    return map[mediaType] || null;
-  }
-
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
     try {
       const m = data?.message;
@@ -3492,39 +3453,12 @@ export class BaileysStartupService extends ChannelStartupService {
         msg.message = JSON.parse(JSON.stringify(msg.message));
       }
 
-      let buffer: Buffer;
-
-      try {
-        buffer = await downloadMediaMessage(
-          { key: msg?.key, message: msg?.message },
-          'buffer',
-          {},
-          { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
-        );
-      } catch (err) {
-        this.logger.error('Download Media failed, trying to retry in 5 seconds...');
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
-        try {
-          const media = await downloadContentFromMessage(
-            {
-              mediaKey: msg.message?.[mediaType]?.mediaKey,
-              directPath: msg.message?.[mediaType]?.directPath,
-              url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
-            },
-            await this.mapMediaType(mediaType),
-            {},
-          );
-          const chunks = [];
-          for await (const chunk of media) {
-            chunks.push(chunk);
-          }
-          buffer = Buffer.concat(chunks);
-          this.logger.info('Download Media with downloadContentFromMessage was successful!');
-        } catch (fallbackErr) {
-          this.logger.error('Download Media with downloadContentFromMessage also failed!');
-        }
-      }
+      const buffer = await downloadMediaMessage(
+        { key: msg?.key, message: msg?.message },
+        'buffer',
+        {},
+        { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+      );
       const typeMessage = getContentType(msg.message);
 
       const ext = mimeTypes.extension(mediaMessage?.['mimetype']);
